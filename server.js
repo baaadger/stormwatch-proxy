@@ -99,27 +99,10 @@ function connect() {
   });
   ws.on('message', (raw) => {
     lastMessageAt = Date.now();
-    diagnostics.messages = (diagnostics.messages || 0) + 1;
-    const str = raw.toString();
-    let dec;
-    try { dec = decode(str); }
-    catch (e) {
-      diagnostics.decodeErr = String(e && e.message || e);
-      if (!diagnostics.sampleRaw) diagnostics.sampleRaw = str.slice(0, 220);
-      return;
-    }
     let obj;
-    try { obj = JSON.parse(dec); }
-    catch (e) {
-      diagnostics.parseErr = String(e && e.message || e);
-      if (!diagnostics.sampleDecoded) { diagnostics.sampleRaw = str.slice(0, 160); diagnostics.sampleDecoded = String(dec).slice(0, 220); }
-      return;
-    }
-    diagnostics.decoded = (diagnostics.decoded || 0) + 1;
-    if (!diagnostics.sampleKeys) { diagnostics.sampleKeys = Object.keys(obj); diagnostics.sampleObj = JSON.stringify(obj).slice(0, 300); }
+    try { obj = JSON.parse(decode(raw.toString())); } catch (e) { return; }
     if (obj && typeof obj.lat === 'number' && typeof obj.lon === 'number') {
-      diagnostics.withLatLon = (diagnostics.withLatLon || 0) + 1;
-      let t = obj.time ? Math.floor(obj.time / 1e6) : Date.now();
+      let t = obj.time ? Math.floor(obj.time / 1e6) : Date.now(); // ns -> ms
       if (t < 1e12) t = Date.now();
       addStrike({ lat: obj.lat, lon: obj.lon, time: t });
     }
