@@ -1,0 +1,152 @@
+/**
+ * StormWatch — Blitzortung -> JSON proxy  (Node.js, runs on Render.com)
+ * ====================================================================
+ * WHY THIS, NOT CLOUDFLARE:
+ *   Blitzortung's live feed is a WebSocket on PORT 3000. Cloudflare Workers
+ *   cannot open port 3000 (proven: "cannot connect to the specified address").
+ *   A normal Node server CAN, so this runs on Render instead. It holds the
+ *   Blitzortung connection, keeps a rolling 30-minute buffer of strikes, and
+ *   serves the exact JSON the StormWatch app already expects.
+ *
+ * ENDPOINTS:
+ *   GET /?lat=48.85&lon=2.35&range=30  ->  { strikes:[ {lat,lon,time(ms)} ], ... }
+ *   GET /health                         ->  { ok, connected, buffered, lastMessageAgoMs }
+ *
+ * Dependency: ws  (declared in package.json — Render installs it automatically).
+ */
+
+const http = require('http');
+const WebSocket = require('ws');
+
+const PORT = process.env.PORT || 8080;
+const HOSTS = [
+  'wss://ws1.blitzortung.org:3000/',
+  'wss://ws7.blitzortung.org:3000/',
+  'wss://ws8.blitzortung.org:3000/',
+];
+const RETAIN_MS = 30 * 60 * 1000;
+const MAX_BUFFER = 6000;
+
+let buffer = [];            // { lat, lon, time(ms) }
+let ws = null;
+let hostIdx = 0;
+let lastMessageAt = 0;
+let reconnectTimer = null;
+
+function addStrike(s) {
+  buffer.push(s);
+  if (buffer.length > MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER);
+}
+function prune() {
+  const cut = Date.now() - RETAIN_MS;
+  buffer = buffer.filter((s) => s.time > cut);
+}
+setInterval(prune, 30000);
+
+// Blitzortung payload decompressor (LZW variant used by their web map).
+function decode(input) {
+  const s = '' + input;
+  if (s.charAt(0) === '{') return s;
+  const data = s.split('');
+  const dict = {};
+  let currChar = data[0];
+  let oldPhrase = currChar;
+  const out = [currChar];
+  let code = 256;
+  let phrase;
+  for (let i = 1; i < data.length; i++) {
+    const currCode = data[i].charCodeAt(0);
+    if (currCode < 256) phrase = data[i];
+    else phrase = dict[currCode] ? dict[currCode] : oldPhrase + currChar;
+    out.push(phrase);
+    currChar = phrase.charAt(0);
+    dict[code] = oldPhrase + currChar;
+    code++;
+    oldPhrase = phrase;
+  }
+  return out.join('');
+}
+
+function connect() {
+  const url = HOSTS[hostIdx % HOSTS.length];
+  hostIdx++;
+  console.log('[bz] connecting', url);
+  ws = new WebSocket(url, { handshakeTimeout: 12000, origin: 'https://www.blitzortung.org' });
+
+  ws.on('open', () => {
+    console.log('[bz] open');
+    lastMessageAt = Date.now();
+    try { ws.send(JSON.stringify({ a: 111 })); } catch (e) {}
+  });
+  ws.on('message', (raw) => {
+    lastMessageAt = Date.now();
+    let obj;
+    try { obj = JSON.parse(decode(raw.toString())); } catch (e) { return; }
+    if (obj && typeof obj.lat === 'number' && typeof obj.lon === 'number') {
+      let t = obj.time ? Math.floor(obj.time / 1e6) : Date.now();
+      if (t < 1e12) t = Date.now();
+      addStrike({ lat: obj.lat, lon: obj.lon, time: t });
+    }
+  });
+  ws.on('close', () => { console.log('[bz] close'); scheduleReconnect(); });
+  ws.on('error', (e) => { console.log('[bz] error', e.message); try { ws.close(); } catch (_) {} });
+}
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 3000);
+}
+// Watchdog: cycle the connection if it goes quiet for 60s.
+setInterval(() => {
+  if (ws && Date.now() - lastMessageAt > 60000) { try { ws.close(); } catch (e) {} }
+}, 20000);
+connect();
+
+function haversine(a, b, c, d) {
+  const R = 3958.8, toR = Math.PI / 180;
+  const dLat = (c - a) * toR, dLon = (d - b) * toR;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a * toR) * Math.cos(c * toR) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+}
+
+const server = http.createServer((req, res) => {
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+    'Content-Type': 'application/json',
+  };
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+
+  const u = new URL(req.url, 'http://x');
+  if (u.pathname === '/health') {
+    res.writeHead(200, cors);
+    res.end(JSON.stringify({
+      ok: true,
+      connected: !!(ws && ws.readyState === 1),
+      buffered: buffer.length,
+      lastMessageAgoMs: lastMessageAt ? Date.now() - lastMessageAt : null,
+    }));
+    return;
+  }
+
+  const lat = parseFloat(u.searchParams.get('lat'));
+  const lon = parseFloat(u.searchParams.get('lon'));
+  const range = parseFloat(u.searchParams.get('range') || '30');
+  if (Number.isNaN(lat) || Number.isNaN(lon)) {
+    res.writeHead(400, cors);
+    res.end(JSON.stringify({ error: 'lat and lon required', connected: !!(ws && ws.readyState === 1), buffered: buffer.length, strikes: [] }));
+    return;
+  }
+
+  prune();
+  const strikes = buffer
+    .map((s) => ({ lat: s.lat, lon: s.lon, time: s.time, dist: haversine(lat, lon, s.lat, s.lon) }))
+    .filter((s) => s.dist <= range)
+    .sort((a, b) => b.time - a.time)
+    .slice(0, 500);
+
+  res.writeHead(200, cors);
+  res.end(JSON.stringify({ connected: !!(ws && ws.readyState === 1), count: strikes.length, strikes }));
+});
+
+server.listen(PORT, () => console.log('[http] listening on :' + PORT));
