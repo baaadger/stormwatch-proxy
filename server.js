@@ -32,6 +32,7 @@ let ws = null;
 let hostIdx = 0;
 let lastMessageAt = 0;
 let reconnectTimer = null;
+const diagnostics = { attempts: 0, connectedEver: false, currentUrl: null, lastError: null, lastErrorCode: null, lastHttpStatus: null, lastOpenAt: null, lastCloseAt: null };
 
 function addStrike(s) {
   buffer.push(s);
@@ -70,11 +71,26 @@ function decode(input) {
 function connect() {
   const url = HOSTS[hostIdx % HOSTS.length];
   hostIdx++;
+  diagnostics.attempts++;
+  diagnostics.currentUrl = url;
   console.log('[bz] connecting', url);
-  ws = new WebSocket(url, { handshakeTimeout: 12000, origin: 'https://www.blitzortung.org' });
+  ws = new WebSocket(url, {
+    handshakeTimeout: 12000,
+    rejectUnauthorized: false, // tolerate cert host/SNI mismatch on :3000
+    origin: 'https://map.blitzortung.org',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Origin': 'https://map.blitzortung.org',
+    },
+  });
 
   ws.on('open', () => {
     console.log('[bz] open');
+    diagnostics.connectedEver = true;
+    diagnostics.lastOpenAt = new Date().toISOString();
+    diagnostics.lastError = null;
+    diagnostics.lastErrorCode = null;
+    diagnostics.lastHttpStatus = null;
     lastMessageAt = Date.now();
     try { ws.send(JSON.stringify({ a: 111 })); } catch (e) {}
   });
@@ -88,8 +104,21 @@ function connect() {
       addStrike({ lat: obj.lat, lon: obj.lon, time: t });
     }
   });
-  ws.on('close', () => { console.log('[bz] close'); scheduleReconnect(); });
-  ws.on('error', (e) => { console.log('[bz] error', e.message); try { ws.close(); } catch (_) {} });
+  // Fired when the server answers the upgrade with a normal HTTP response (e.g. 403/404).
+  ws.on('unexpected-response', (req, res) => {
+    diagnostics.lastHttpStatus = res.statusCode;
+    diagnostics.lastError = 'unexpected HTTP ' + res.statusCode;
+    console.log('[bz] unexpected-response', res.statusCode);
+    try { ws.close(); } catch (e) {}
+    scheduleReconnect();
+  });
+  ws.on('close', (code) => { diagnostics.lastCloseAt = new Date().toISOString(); console.log('[bz] close', code); scheduleReconnect(); });
+  ws.on('error', (e) => {
+    diagnostics.lastError = String(e && e.message || e);
+    diagnostics.lastErrorCode = (e && e.code) || null;
+    console.log('[bz] error', diagnostics.lastError);
+    try { ws.close(); } catch (_) {}
+  });
 }
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -125,6 +154,7 @@ const server = http.createServer((req, res) => {
       connected: !!(ws && ws.readyState === 1),
       buffered: buffer.length,
       lastMessageAgoMs: lastMessageAt ? Date.now() - lastMessageAt : null,
+      diagnostics,
     }));
     return;
   }
