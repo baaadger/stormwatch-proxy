@@ -49,7 +49,6 @@ setInterval(prune, 30000);
 // Blitzortung payload decompressor (LZW variant used by their web map).
 function decode(input) {
   const s = '' + input;
-  if (s.charAt(0) === '{') return s;
   const data = s.split('');
   const dict = {};
   let currChar = data[0];
