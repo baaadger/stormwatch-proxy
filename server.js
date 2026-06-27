@@ -20,9 +20,11 @@ const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const HOSTS = [
-  'wss://ws1.blitzortung.org:3000/',
+  'wss://ws1.blitzortung.org/',        // port 443 (current standard) — try first
+  'wss://ws7.blitzortung.org/',
+  'wss://ws8.blitzortung.org/',
+  'wss://ws1.blitzortung.org:3000/',   // legacy port 3000 fallback
   'wss://ws7.blitzortung.org:3000/',
-  'wss://ws8.blitzortung.org:3000/',
 ];
 const RETAIN_MS = 30 * 60 * 1000;
 const MAX_BUFFER = 6000;
@@ -32,7 +34,7 @@ let ws = null;
 let hostIdx = 0;
 let lastMessageAt = 0;
 let reconnectTimer = null;
-const diagnostics = { attempts: 0, connectedEver: false, currentUrl: null, lastError: null, lastErrorCode: null, lastHttpStatus: null, lastOpenAt: null, lastCloseAt: null };
+const diagnostics = { attempts: 0, connectedEver: false, currentUrl: null, lastError: null, lastErrorCode: null, lastHttpStatus: null, lastOpenAt: null, lastCloseAt: null, urlStatus: {} };
 
 function addStrike(s) {
   buffer.push(s);
@@ -73,6 +75,7 @@ function connect() {
   hostIdx++;
   diagnostics.attempts++;
   diagnostics.currentUrl = url;
+  diagnostics.urlStatus[url] = 'connecting';
   console.log('[bz] connecting', url);
   ws = new WebSocket(url, {
     handshakeTimeout: 12000,
@@ -88,6 +91,7 @@ function connect() {
     console.log('[bz] open');
     diagnostics.connectedEver = true;
     diagnostics.lastOpenAt = new Date().toISOString();
+    diagnostics.urlStatus[url] = 'OPEN';
     diagnostics.lastError = null;
     diagnostics.lastErrorCode = null;
     diagnostics.lastHttpStatus = null;
@@ -108,6 +112,7 @@ function connect() {
   ws.on('unexpected-response', (req, res) => {
     diagnostics.lastHttpStatus = res.statusCode;
     diagnostics.lastError = 'unexpected HTTP ' + res.statusCode;
+    diagnostics.urlStatus[url] = 'HTTP ' + res.statusCode;
     console.log('[bz] unexpected-response', res.statusCode);
     try { ws.close(); } catch (e) {}
     scheduleReconnect();
@@ -116,6 +121,7 @@ function connect() {
   ws.on('error', (e) => {
     diagnostics.lastError = String(e && e.message || e);
     diagnostics.lastErrorCode = (e && e.code) || null;
+    if (diagnostics.urlStatus[url] !== 'OPEN') diagnostics.urlStatus[url] = (e && e.code) || String(e && e.message || e);
     console.log('[bz] error', diagnostics.lastError);
     try { ws.close(); } catch (_) {}
   });
